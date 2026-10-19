@@ -39,7 +39,7 @@ function system_commands_menu() {
       make -j$(nproc)  # 多线程编译加速
       sudo make install
       masscan --version
-      cd root
+      cd /root
       rm -rf /root/masscan
       ;;
     4)
@@ -189,7 +189,7 @@ function scan_menu() {
       ;;
     4)
       echo "正在克隆 Scan 文件..."
-      cd root && git clone https://github.com/H4ckChina/Scan.git && rm -rf /root/Scan/.git && chmod +wx /root/Scan/Scan.sh
+      cd /root && git clone https://github.com/H4ckChina/Scan.git && rm -rf /root/Scan/.git && chmod +wx /root/Scan/Scan.sh
       ;;
     5)
       echo "正在优化系统..."
