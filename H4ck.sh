@@ -193,36 +193,51 @@ function scan_menu() {
       ;;
     5)
       echo "正在优化系统..."
-      # 配置 ulimit
-      ulimit -n 1000000
-      ulimit -u 65535
-      ulimit -s 65536
-      # 写入 sysctl 配置
-      add_sysctl_param() {
-      local key=$1
-      local value=$2
-      if grep -q "^$key" /etc/sysctl.conf; then
-      sed -i "s/^$key.*/$key = $value/" /etc/sysctl.conf
-      else
-      echo "$key = $value" >> /etc/sysctl.conf
-      fi
-      }
-      add_sysctl_param "net.ipv4.tcp_max_syn_backlog" "65536"
-      add_sysctl_param "net.core.netdev_max_backlog" "65536"
-      add_sysctl_param "net.ipv4.tcp_synack_retries" "2"
-      add_sysctl_param "net.ipv4.tcp_fin_timeout" "15"
-      add_sysctl_param "net.ipv4.tcp_keepalive_time" "600"
-      add_sysctl_param "net.ipv4.tcp_tw_reuse" "1"
-      add_sysctl_param "net.ipv4.ip_local_port_range" "1024 65535"
-      add_sysctl_param "net.core.rmem_max" "16777216"
-      add_sysctl_param "net.core.wmem_max" "16777216"
-      add_sysctl_param "net.ipv4.tcp_rmem" "4096 87380 16777216"
-      add_sysctl_param "net.ipv4.tcp_wmem" "4096 65536 16777216"
-      add_sysctl_param "net.core.somaxconn" "65535"
-      add_sysctl_param "fs.file-max" "2097152"
-      add_sysctl_param "net.ipv4.tcp_slow_start_after_idle" "0"
-      # 使修改生效
+      echo "===== 开始Masscan系统调优 ====="
+
+      # 1. 文件句柄上限
+      ulimit -n 1048576
+      echo "* soft nofile 1048576" >> /etc/security/limits.conf
+      echo "* hard nofile 1048576" >> /etc/security/limits.conf
+
+      # 2. 内核网络参数 sysctl
+cat >> /etc/sysctl.conf << EOF
+# 关闭TCP连接跟踪超时快速回收
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 30
+
+# 增大连接跟踪表，masscan大量发包必调
+net.netfilter.nf_conntrack_max = 2621440
+net.netfilter.nf_conntrack_buckets = 655360
+net.netfilter.nf_conntrack_timeout = 10
+
+# 原始套接字相关
+net.ipv4.ip_nonlocal_bind = 1
+net.ipv4.raw_locks = 0
+
+# 端口范围扩大
+net.ipv4.ip_local_port_range = 1024 65535
+
+# 忽略广播响应，减少干扰
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+EOF
+
+      # 加载sysctl新配置
       sysctl -p
+
+      # 3. 关闭网卡TCP Offload（校验和卸载，高速扫描容易出错）
+      # 自动识别网卡，一般eth0 / ens3，你可以手动替换网卡名
+      NIC=$(ip route get 8.8.8.8 | awk '/dev/ {print $5;exit}')
+      echo "检测到主网卡：$NIC"
+      ethtool -K $NIC tx off rx off sg off tso off gso off gro off
+
+      # 4. 清空iptables，避免本地防火墙拦截（内网测试用！）
+      iptables -F
+      iptables -t raw -F
+
+      echo "=====调优完成！====="
+      echo "注意：网卡offload重启后会恢复，每次重启机器需要重新执行ethtool那一行"
+      echo "nf_conntrack、nofile 重启永久生效"
       ;;
     0)
       return 0
