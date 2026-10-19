@@ -187,6 +187,7 @@ function scan_menu() {
       ;;
     4)
       echo "正在克隆 Scan 文件..."
+      cd root
       git clone https://github.com/H4ckChina/Scan.git && rm -rf /root/Scan/.git && chmod +wx /root/Scan/Scan.sh
       ;;
     5)
