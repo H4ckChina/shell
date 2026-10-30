@@ -122,46 +122,6 @@ function proxy_menu() {
   proxy_menu
 }
 
-# Get 类菜单：包含创建、运行、恢复、销毁 Get 窗口
-function get_menu() {
-  clear
-   printf "+------------------------------------------------------+\n"
-    printf "|     1. 创建 Get 窗口      |     2. 恢复 Get 窗口     |\n"
-    printf "+------------------------------------------------------+\n"
-    printf "|     3. 销毁 Get 窗口      |     4. 克隆 Get 文件     |\n"
-    printf "+------------------------------------------------------+\n"
-    printf "|                    0. 返回主菜单                     |\n"
-    printf "+------------------------------------------------------+\n"
-  echo
-  read -p "请选择: " choice
-  case $choice in
-    1)
-      echo "正在创建 Get 窗口..."
-      screen -d -m -S Get bash -c "cd /root/Get && node Get.js"
-      ;;
-    2)
-      echo "正在恢复 Get 窗口..."
-      screen -r Get
-      ;;
-    3)
-      echo "正在销毁 Get 窗口..."
-      screen -S Get -X quit
-      ;;
-    4)
-      echo "正在克隆 Get 文件..."
-      git clone https://github.com/H4ckChina/Get.git && rm -rf /root/Get/.git && rm -rf /root/Get/README.md && chmod +wx /root/Get/Get.js
-      ;;
-    0)
-      return 0
-      ;;
-    *)
-      echo "无效选项，请重新输入"
-      ;;
-  esac
-  pause
-  get_menu
-}
-
 # Scan 类菜单：包含创建、运行、恢复、销毁 Scan 窗口
 function scan_menu() {
   clear
@@ -193,7 +153,6 @@ function scan_menu() {
       ;;
     5)
       echo "正在优化系统..."
-#!/usr/bin/env bash
 # =============================================================================
 #  masscan-tune.sh   v2.2  (2026-10-31)
 #  Ubuntu 24.04 LTS / Debian 系 —— masscan 扫描性能自动检测 · 调优 · 效果验证
@@ -223,7 +182,7 @@ function scan_menu() {
 # =============================================================================
 # shellcheck disable=SC2016,SC2086,SC2129,SC1091
 
-set -uo pipefail
+# set -uo pipefail   # 作为 H4ck.sh 的子功能运行，不能改宿主 shell 选项
 
 SCRIPT_VER="2.2"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -378,7 +337,7 @@ parse_args() {
       --bench-secs)   BENCH_SECS="${2:-3}"; shift ;;
       --bench-ports)  BENCH_PORTS="${2:-auto}"; shift ;;
       --report-md)    REPORT_MD="${2:-}"; shift ;;
-      -h|--help) usage; exit 0 ;;
+      -h|--help) usage; return 0 ;;
       *) err "未知参数: $1"; usage; exit 2 ;;
     esac
     shift
@@ -392,320 +351,7 @@ require_root() {
       exec sudo -E bash "$0" "$@"
     fi
     err "请以 root 运行: sudo $0 $*"
-    exit 1
-  fi
-  mkdir -p "$BACKUP_ROOT" 2>/dev/null || true
-}
-
-# =============================================================================
-#  阶段一：检测
-# =============================================================================
-detect_system() {
-  info "探测系统信息…"
-  if [ -r /etc/os-release ]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    DISTRO="${PRETTY_NAME:-${NAME:-Linux} ${VERSION_ID:-}}"
-  else
-    DISTRO="$(uname -s)"
-  fi
-  KERNEL="$(uname -r)"
-  ARCH="$(uname -m)"
-
-  if have lscpu; then HAS_LSCPU=1; fi
-  CPU_MODEL="$(awk -F: '/model name/{gsub(/^ +/,"",$2);print $2;exit}' /proc/cpuinfo)"
-  [ -z "$CPU_MODEL" ] && CPU_MODEL="$(rd /proc/cpuinfo unknown)"
-  CPU_LOGICAL="$(nproc 2>/dev/null || echo 1)"
-  if [ "$HAS_LSCPU" -eq 1 ]; then
-    CPU_PHYS="$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l | tr -d ' ')"
-    CPU_MHZ="$(lscpu 2>/dev/null | awk -F: '/MHz/{gsub(/^ +/,"",$2);print $2;exit}')"
-  fi
-  [ -z "${CPU_PHYS:-}" ] || [ "$CPU_PHYS" -eq 0 ] 2>/dev/null && CPU_PHYS=$CPU_LOGICAL
-  [ -z "$CPU_MHZ" ] && CPU_MHZ="$(awk -F: '/cpu MHz/{gsub(/^ +/,"",$2);print $2;exit}' /proc/cpuinfo)"
-
-  MEM_TOTAL_MB="$(awk '/MemTotal/{printf "%d",$2/1024}' /proc/meminfo)"
-  MEM_AVAIL_MB="$(awk '/MemAvailable/{printf "%d",$2/1024}' /proc/meminfo)"
-  [ -z "$MEM_TOTAL_MB" ] && MEM_TOTAL_MB=0
-  [ -z "$MEM_AVAIL_MB" ] && MEM_AVAIL_MB=$MEM_TOTAL_MB
-
-  GOVERNOR="$(rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor "n/a")"
-  if [ -r /sys/module/intel_idle/parameters/max_cstate ]; then
-    CUR_CSTATE="$(cat /sys/module/intel_idle/parameters/max_cstate 2>/dev/null)"
-  elif [ -r /sys/module/processor/parameters/max_cstate ]; then
-    CUR_CSTATE="$(cat /sys/module/processor/parameters/max_cstate 2>/dev/null)"
-  else
-    CUR_CSTATE="n/a"
-  fi
-
-  # 依赖自检：缺什么就降级什么，并提示安装命令
-  local missing=""
-  have ethtool   || missing="$missing ethtool"
-  have nft       || { have iptables || missing="$missing nftables"; }
-  have conntrack || missing="$missing conntrack"
-  have lscpu     || missing="$missing util-linux"
-  [ -n "$missing" ] && NOTES+=("缺失工具:$missing（apt install$missing）")
-
-  have ethtool   && HAS_ETHTOOL=1
-  have nft       && HAS_NFT=1
-  have iptables  && HAS_IPT=1
-  have conntrack && HAS_CONNTRACK=1
-  have cpupower  && HAS_CPUPOWER=1
-  have masscan   && HAS_MASSCAN=1
-  [ -d /proc/net/pf_ring ] || lsmod 2>/dev/null | grep -q '^pf_ring' && HAS_PFRING=1
-  systemctl is-active --quiet irqbalance 2>/dev/null && IRQBAL_ACTIVE=1
-
-  if [ "$HAS_MASSCAN" -eq 1 ]; then
-    MASSCAN_VER="$(masscan --version 2>&1 | head -2 | tr '\n' ' ')"
-    masscan --version 2>&1 | grep -qi 'PF_RING.*enabled\|pfring' && MASSCAN_PFRING="yes"
-  fi
-}
-
-detect_network() {
-  info "探测网卡与链路…"
-  # 网卡探测三路兜底：ip route → /proc/net/route → /sys/class/net
-  IFACE="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')"
-  [ -z "$IFACE" ] && IFACE="$(awk '$2=="00000000"{print $1;exit}' /proc/net/route 2>/dev/null)"
-  [ -z "$IFACE" ] && IFACE="$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -1)"
-  if [ -z "$IFACE" ]; then
-    warn "未找到可用网卡，网卡层调优将跳过"
-    NO_NIC=1
-    IF_SPEED="unknown"
-    return
-  fi
-  IF_MAC="$(rd "/sys/class/net/$IFACE/address" "")"
-  IF_MTU="$(rd "/sys/class/net/$IFACE/mtu" "1500")"
-  IF_IP="$(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
-  GW_IP="$(ip -4 route show default 2>/dev/null | awk '{print $3;exit}')"
-  IF_DRIVER=""
-  if [ -e "/sys/class/net/$IFACE/device/driver" ]; then
-    IF_DRIVER="$(basename "$(readlink -f "/sys/class/net/$IFACE/device/driver")")"
-  fi
-  case "$IF_DRIVER" in
-    virtio_net|vmxnet3|xen-netfront|hv_netvsc|veth|"") IF_VIRT="vm" ;;
-    *) IF_VIRT="phy" ;;
-  esac
-  if [ "$HAS_ETHTOOL" -eq 1 ]; then
-    IF_SPEED="$(ethtool "$IFACE" 2>/dev/null | awk -F: '/Speed/{gsub(/[^0-9]/,"",$2);print $2;exit}')"
-    [ -z "$IF_SPEED" ] && IF_SPEED="unknown"
-  else
-    IF_SPEED="unknown"
-  fi
-  [ -z "$IF_SPEED" ] && IF_SPEED="unknown"
-
-  # 网关 MAC：拿不到 --router-mac 时 masscan 要自己 ARP，会拖慢 10 倍以上
-  if [ -n "$GW_IP" ]; then
-    GW_MAC="$(gw_mac_lookup)"
-    if [ -z "$GW_MAC" ]; then
-      warn "网关 MAC 未解析，尝试主动触发 ARP…"
-      ping -c 1 -W 1 "$GW_IP" >/dev/null 2>&1 || true
-      have arping && arping -c 1 -w 2 -I "$IFACE" "$GW_IP" >/dev/null 2>&1 || true
-      sleep 0.5
-      GW_MAC="$(gw_mac_lookup)"
-    fi
-    if [ -n "$GW_MAC" ]; then
-      ok "网关 MAC: $GW_MAC"
-    else
-      warn "网关 MAC 仍然取不到 —— 基准测试会因 masscan 自己 ARP 而严重偏慢，请手动指定 --router-mac"
-    fi#!/usr/bin/env bash
-# =============================================================================
-#  masscan-tune.sh   v2.2  (2026-10-31)
-#  Ubuntu 24.04 LTS / Debian 系 —— masscan 扫描性能自动检测 · 调优 · 效果验证
-#
-#  功能：
-#    1) 自动探测：发行版 / 内核 / CPU / 内存 / 网卡 / 驱动 / 链路速率 /
-#                 PF_RING / masscan 版本 / 现有内核参数 / 现有网卡参数
-#    2) 自动决策：按内存、核数、链路速率推导目标参数（不是无脑抄固定值）
-#    3) 自动下发：sysctl / ulimit / ethtool / IRQ / governor / nftables
-#    4) 自动测效：调优前后各跑一次同条件发包基准，输出实际 pps 与提升幅度
-#    5) 自动备份：所有改动前的状态存盘，支持一键回滚
-#
-#  版本：
-#    v2.0  veth 隔离基准，零外泄；速率改取 masscan 自报最大值
-#    v2.1  粗扫 + 二分收敛，推荐值 = 实测上限（不再打折）
-#    v2.2  新增 --bench-wan 真实外网标定（指标=网卡实发，3 次取中位数）
-#
-#  用法：
-#    sudo ./masscan-tune.sh                 # 默认 safe 级别，自动测效
-#    sudo ./masscan-tune.sh --aggressive    # 追加 CPU/IRQ 激进调优
-#    sudo ./masscan-tune.sh --dry-run       # 只检测+出方案，不落盘
-#    sudo ./masscan-tune.sh --skip-bench    # 不做发包基准
-#    sudo ./masscan-tune.sh --restore       # 回滚到最近一次备份
-#
-#  注意：默认基准目标 = 脚本顶部 DEFAULT_BENCH_TARGET（真实网卡、真实发包）。
-#        想零外发请加 --bench-local。
-# =============================================================================
-# shellcheck disable=SC2016,SC2086,SC2129,SC1091
-
-set -uo pipefail
-
-SCRIPT_VER="2.2"
-TS="$(date +%Y%m%d-%H%M%S)"
-LOG_DIR=""                                    # 不写日志文件
-BACKUP_ROOT="/tmp/.masscan-tune-backup"       # 备份放 tmp，重启自动清
-LOG_FILE=""
-BACKUP_DIR="${BACKUP_ROOT}/${TS}"
-SYSCTL_CONF="/etc/sysctl.d/99-masscan.conf"
-LIMITS_CONF="/etc/security/limits.d/99-masscan.conf"
-SYSTEMD_CONF="/etc/systemd/system.conf.d/99-masscan.conf"
-EXCLUDE_FILE="/etc/masscan/exclude.conf"
-
-# ---- 运行选项 ---------------------------------------------------------------
-MODE="safe"            # safe | aggressive
-DRY_RUN=0
-RESTORE=0
-SKIP_BENCH=0
-NO_NIC=0
-# ★ 默认基准目标：直接 sudo ./masscan-tune.sh 就用这里
-#   改成你自己的授权网段即可；留空字符串则回退到 veth 隔离模式
-DEFAULT_BENCH_TARGET="220.128.0.0/12 220.160.0.0/11"
-BENCH_TARGET="${DEFAULT_BENCH_TARGET}"   # auto | 显式 CIDR/IP，可空格分隔多个
-BENCH_TARGETS=()        # 解析后的目标段数组
-BENCH_MODE="auto"       # auto | local | external
-BENCH_RATE=""
-BENCH_SECS=3
-BENCH_PORTS="auto"
-BENCH_PORTS_ACTUAL=""
-BENCH_HOSTS=1
-BENCH_TARGET_SRC=""
-BENCH_IFACE="" BENCH_SRC_IP="" BENCH_SRC_MAC="" BENCH_ROUTER_MAC=""
-BENCH_ISOLATED=0 NETNS_NAME="mstune" NS_LINK="msp"
-BENCH_WAN="" WAN_PORTS="80,443,22" WAN_DUR=5
-WAN_REAL_PPS=0 WAN_SELF_PPS=0 WAN_MBPS=0 WAN_FOUND=0
-BENCH_MAX_PKTS=30000
-BENCH_MAX_PKTS_ISO=300000
-CALIBRATE=1
-RATE_FORMULA=0
-RATE_MEASURED=0
-declare -a CAL_ROWS=()   # "档位|实测pps|达成率|判定"
-REPORT_MD=""
-SCAN_DIR="/root/Scan" SCAN_SYNC=1
-
-# ---- 颜色 -------------------------------------------------------------------
-if [ -t 1 ]; then
-  C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'
-  C_B=$'\033[36m'; C_D=$'\033[1m';  C_0=$'\033[0m'
-else
-  C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_0=""
-fi
-
-# ---- 全局探测结果 -----------------------------------------------------------
-DISTRO="" KERNEL="" ARCH=""
-CPU_MODEL="" CPU_LOGICAL=0 CPU_PHYS=0 CPU_MHZ=""
-GOVERNOR="" CUR_CSTATE=""
-MEM_TOTAL_MB=0 MEM_AVAIL_MB=0
-IFACE="" IF_DRIVER="" IF_SPEED="" IF_MAC="" IF_IP="" IF_MTU="" IF_VIRT=""
-GW_IP="" GW_MAC=""
-HAS_ETHTOOL=0 HAS_NFT=0 HAS_IPT=0 HAS_CONNTRACK=0 HAS_IRQBAL=0
-HAS_CPUPOWER=0 HAS_MASSCAN=0 HAS_LSCPU=0 HAS_PFRING=0
-MASSCAN_VER="" MASSCAN_PFRING="no"
-IRQBAL_ACTIVE=0
-
-# ---- 计划/变更 --------------------------------------------------------------
-declare -A SYSCTL_OLD=()
-declare -A SYSCTL_NEW=()
-declare -A SYSCTL_RESULT=()     # ok | fail | skip | keep
-declare -A SYSCTL_KEEP=()       # 现值已达标，无需改动
-declare -a CHANGE_ROWS=()       # "键|旧值|新值|说明"
-declare -a ACTION_ROWS=()       # "动作|结果|说明"
-declare -a NOTES=()
-
-NIC_OLD_RX=0 NIC_OLD_TX=0 NIC_MAX_RX=0 NIC_MAX_TX=0
-NIC_NEW_RX=0 NIC_NEW_TX=0 NIC_OLD_Q=0 NIC_MAX_Q=0 NIC_NEW_Q=0
-NIC_OLD_TXQ=0 NIC_NEW_TXQ=0
-declare -A OFFLOAD_OLD=() OFFLOAD_NEW=()
-IRQ_BOUND=0
-
-RECOMMEND_RATE=100000
-
-# ---- 基准测试结果 -----------------------------------------------------------
-BENCH_BEFORE_PPS=0 BENCH_BEFORE_OK=0
-BENCH_AFTER_PPS=0  BENCH_AFTER_OK=0
-BENCH_BEFORE_DROP=0 BENCH_AFTER_DROP=0
-BENCH_BEFORE_NICERR=0 BENCH_AFTER_NICERR=0
-BENCH_BEFORE_ACH=0 BENCH_AFTER_ACH=0
-BENCH_INVALID=0
-PROBE_TX_PPS=0 PROBE_M_PPS=0 PROBE_DROP=0 PROBE_NICERR=0 PROBE_MS=0 PROBE_SENT=0
-PROBE_RAW="" PROBE_TX0=0 PROBE_TX1=0 PROBE_WALL=0 PROBE_FOUND=0 PROBE_REAL_PPS=0
-PROBE_LOG="" PROBE_RAWFILE=""
-
-# =============================================================================
-#  基础工具
-# =============================================================================
-log()  { local m="[$(date +%H:%M:%S)] $*"; printf '%s\n' "$m"; [ -n "${LOG_FILE:-}" ] && printf '%s\n' "$m" >>"$LOG_FILE" 2>/dev/null; }
-info() { printf '%s[*]%s %s\n' "$C_B" "$C_0" "$*"; }
-ok()   { printf '%s[+]%s %s\n' "$C_G" "$C_0" "$*"; }
-warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_0" "$*"; NOTES+=("$*"); }
-err()  { printf '%s[x]%s %s\n' "$C_R" "$C_0" "$*"; }
-hr()   { printf '%s\n' "-------------------------------------------------------------------------------"; }
-have() { command -v "$1" >/dev/null 2>&1; }
-
-# 读取文件首值，失败返回默认
-rd() { local f="$1" d="${2:-}"; if [ -r "$f" ]; then cat "$f" 2>/dev/null | head -1; else printf '%s' "$d"; fi; }
-num() { printf '%s' "${1:-0}" | tr -cd '0-9' ; }
-
-# 数值夹逼
-clamp() { local v=$1 lo=$2 hi=$3; [ "$v" -lt "$lo" ] && v=$lo; [ "$v" -gt "$hi" ] && v=$hi; printf '%s' "$v"; }
-
-usage() {
-  awk 'NR>1{ if ($0 ~ /^# =+$/) { if (seen) exit; seen=1; next } sub(/^# ?/,""); print }' "$0"
-  cat <<'EOF'
-
-选项:
-  --aggressive         追加效果更激进但需重启/影响功耗的调优(governor、IRQ、C-state)
-  --dry-run            只检测并打印方案，不修改任何文件
-  --skip-bench         跳过基准测试与 rate 校准
-  --no-calibrate       只做前后对比，不做阶梯 rate 校准
-  --bench-target ARG   覆盖默认基准目标（IP / CIDR，可空格分隔多个）
-  --bench-wan "CIDR"   真实外网标定：用你授权的目标段测出口上限（判据=网卡实发包数）
-  --wan-ports P        外网标定用的端口，默认 80,443,22
-  --bench-local        用本地保留段 192.0.2.0/24 + router-mac（默认，零外部流量）
-  --bench-rate PPS     前后对比用的固定速率，默认 min(公式值, 50000)
-  --bench-secs N       每档跑满的秒数，默认 3（发包量 = rate × N）
-  --no-nic             跳过网卡层调优（虚拟机/容器环境）
-  --report-md PATH     额外输出 Markdown 报告
-  --restore            用最近一次备份回滚
-  -h, --help           显示帮助
-
-基准说明:
-  默认直接对你的授权网段做真实标定（见脚本顶部 DEFAULT_BENCH_TARGET）。
-  想完全不发外部包，加 --bench-local 走 veth 隔离。
-EOF
-}
-
-parse_args() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --aggressive) MODE="aggressive" ;;
-      --dry-run)    DRY_RUN=1 ;;
-      --skip-bench) SKIP_BENCH=1 ;;
-      --no-nic)     NO_NIC=1 ;;
-      --restore)    RESTORE=1 ;;
-      --bench-target) BENCH_TARGET="${2:-auto}"; shift ;;
-      --bench-local)  BENCH_MODE="local" ;;
-      --bench-wan)    BENCH_WAN="${2:-}"; shift ;;
-      --wan-ports)    WAN_PORTS="${2:-80,443,22}"; shift ;;
-      --no-calibrate) CALIBRATE=0 ;;
-      --no-scan-sync) SCAN_SYNC=0 ;;
-      --scan-dir)     SCAN_DIR="${2:-/root/Scan}"; shift ;;
-      --bench-rate)   BENCH_RATE="${2:-}"; shift ;;
-      --bench-secs)   BENCH_SECS="${2:-3}"; shift ;;
-      --bench-ports)  BENCH_PORTS="${2:-auto}"; shift ;;
-      --report-md)    REPORT_MD="${2:-}"; shift ;;
-      -h|--help) usage; exit 0 ;;
-      *) err "未知参数: $1"; usage; exit 2 ;;
-    esac
-    shift
-  done
-}
-
-require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    if have sudo && [ -t 0 ]; then
-      info "需要 root 权限，自动提权重执行…"
-      exec sudo -E bash "$0" "$@"
-    fi
-    err "请以 root 运行: sudo $0 $*"
-    exit 1
+    return 1
   fi
   mkdir -p "$BACKUP_ROOT" 2>/dev/null || true
 }
@@ -2007,7 +1653,7 @@ main() {
 
   if [ "$RESTORE" -eq 1 ]; then
     do_restore
-    exit 0
+    return 0
   fi
 
   printf '%s' "$C_D"
@@ -2029,7 +1675,7 @@ BANNER
   if [ "$DRY_RUN" -eq 1 ]; then
     info "dry-run 模式，仅展示方案，不做任何修改"
     report
-    exit 0
+    return 0
   fi
 
   PROBE_LOG="/tmp/.masscan-tune-probe-${TS}.log"
@@ -2106,7 +1752,7 @@ BANNER
   printf '\n%s完成。%s\n' "$C_G" "$C_0"
 }
 
-main "$@"
+      main
       ;;
     0)
       return 0
@@ -2126,9 +1772,7 @@ function main_menu() {
     printf "+------------------------------------------------------+\n"
     printf "|        H4ck China Sh       |          v$sh_v         |\n"
     printf "+------------------------------------------------------+\n"
-    printf "|         1. 系统命令        |          2. Proxy       |\n"
-    printf "+------------------------------------------------------+\n"
-    printf "|         3. Get             |          4. Scan        |\n"
+    printf "|   1. 系统命令    |    2. Proxy    |    3. Scan       |\n"
     printf "+------------------------------------------------------+\n"
     printf "|                        0. 退出                       |\n"
     printf "+------------------------------------------------------+\n"
@@ -2142,9 +1786,6 @@ function main_menu() {
         proxy_menu
         ;;
       3)
-        get_menu
-        ;;
-      4)
         scan_menu
         ;;
       0)
