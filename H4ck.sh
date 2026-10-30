@@ -195,7 +195,7 @@ function scan_menu() {
       echo "正在优化系统..."
 #!/usr/bin/env bash
 # =============================================================================
-#  masscan-tune.sh   v1.0
+#  masscan-tune.sh   v2.2  (2026-10-31)
 #  Ubuntu 24.04 LTS / Debian 系 —— masscan 扫描性能自动检测 · 调优 · 效果验证
 #
 #  功能：
@@ -206,6 +206,11 @@ function scan_menu() {
 #    4) 自动测效：调优前后各跑一次同条件发包基准，输出实际 pps 与提升幅度
 #    5) 自动备份：所有改动前的状态存盘，支持一键回滚
 #
+#  版本：
+#    v2.0  veth 隔离基准，零外泄；速率改取 masscan 自报最大值
+#    v2.1  粗扫 + 二分收敛，推荐值 = 实测上限（不再打折）
+#    v2.2  新增 --bench-wan 真实外网标定（指标=网卡实发，3 次取中位数）
+#
 #  用法：
 #    sudo ./masscan-tune.sh                 # 默认 safe 级别，自动测效
 #    sudo ./masscan-tune.sh --aggressive    # 追加 CPU/IRQ 激进调优
@@ -213,18 +218,18 @@ function scan_menu() {
 #    sudo ./masscan-tune.sh --skip-bench    # 不做发包基准
 #    sudo ./masscan-tune.sh --restore       # 回滚到最近一次备份
 #
-#  注意：基准测试会向 192.0.2.0/24 (RFC5737 TEST-NET-1) 发送 SYN 包，
-#        仅用于测量本机真实发包能力，可用 --bench-target 改目标。
+#  注意：默认基准目标 = 脚本顶部 DEFAULT_BENCH_TARGET（真实网卡、真实发包）。
+#        想零外发请加 --bench-local。
 # =============================================================================
 # shellcheck disable=SC2016,SC2086,SC2129,SC1091
 
 set -uo pipefail
 
-SCRIPT_VER="1.0"
+SCRIPT_VER="2.2"
 TS="$(date +%Y%m%d-%H%M%S)"
-LOG_DIR="/var/log/masscan-tune"
-BACKUP_ROOT="/var/backups/masscan-tune"
-LOG_FILE="${LOG_DIR}/tune-${TS}.log"
+LOG_DIR=""                                    # 不写日志文件
+BACKUP_ROOT="/tmp/.masscan-tune-backup"       # 备份放 tmp，重启自动清
+LOG_FILE=""
 BACKUP_DIR="${BACKUP_ROOT}/${TS}"
 SYSCTL_CONF="/etc/sysctl.d/99-masscan.conf"
 LIMITS_CONF="/etc/security/limits.d/99-masscan.conf"
@@ -237,12 +242,30 @@ DRY_RUN=0
 RESTORE=0
 SKIP_BENCH=0
 NO_NIC=0
-BENCH_TARGET="192.0.2.0/24"
+# ★ 默认基准目标：直接 sudo ./masscan-tune.sh 就用这里
+#   改成你自己的授权网段即可；留空字符串则回退到 veth 隔离模式
+DEFAULT_BENCH_TARGET="220.128.0.0/12 220.160.0.0/11"
+BENCH_TARGET="${DEFAULT_BENCH_TARGET}"   # auto | 显式 CIDR/IP，可空格分隔多个
+BENCH_TARGETS=()        # 解析后的目标段数组
+BENCH_MODE="auto"       # auto | local | external
 BENCH_RATE=""
-BENCH_SECS=5
+BENCH_SECS=3
 BENCH_PORTS="auto"
 BENCH_PORTS_ACTUAL=""
+BENCH_HOSTS=1
+BENCH_TARGET_SRC=""
+BENCH_IFACE="" BENCH_SRC_IP="" BENCH_SRC_MAC="" BENCH_ROUTER_MAC=""
+BENCH_ISOLATED=0 NETNS_NAME="mstune" NS_LINK="msp"
+BENCH_WAN="" WAN_PORTS="80,443,22" WAN_DUR=5
+WAN_REAL_PPS=0 WAN_SELF_PPS=0 WAN_MBPS=0 WAN_FOUND=0
+BENCH_MAX_PKTS=30000
+BENCH_MAX_PKTS_ISO=300000
+CALIBRATE=1
+RATE_FORMULA=0
+RATE_MEASURED=0
+declare -a CAL_ROWS=()   # "档位|实测pps|达成率|判定"
 REPORT_MD=""
+SCAN_DIR="/root/Scan" SCAN_SYNC=1
 
 # ---- 颜色 -------------------------------------------------------------------
 if [ -t 1 ]; then
@@ -287,6 +310,10 @@ BENCH_AFTER_PPS=0  BENCH_AFTER_OK=0
 BENCH_BEFORE_DROP=0 BENCH_AFTER_DROP=0
 BENCH_BEFORE_NICERR=0 BENCH_AFTER_NICERR=0
 BENCH_BEFORE_ACH=0 BENCH_AFTER_ACH=0
+BENCH_INVALID=0
+PROBE_TX_PPS=0 PROBE_M_PPS=0 PROBE_DROP=0 PROBE_NICERR=0 PROBE_MS=0 PROBE_SENT=0
+PROBE_RAW="" PROBE_TX0=0 PROBE_TX1=0 PROBE_WALL=0 PROBE_FOUND=0 PROBE_REAL_PPS=0
+PROBE_LOG="" PROBE_RAWFILE=""
 
 # =============================================================================
 #  基础工具
@@ -313,14 +340,22 @@ usage() {
 选项:
   --aggressive         追加效果更激进但需重启/影响功耗的调优(governor、IRQ、C-state)
   --dry-run            只检测并打印方案，不修改任何文件
-  --skip-bench         跳过调优前后发包基准
-  --bench-target CIDR  基准目标网段，默认 192.0.2.0/24
-  --bench-rate PPS     基准发包速率，默认自动按链路推导
-  --bench-secs N       基准持续秒数，默认 5
+  --skip-bench         跳过基准测试与 rate 校准
+  --no-calibrate       只做前后对比，不做阶梯 rate 校准
+  --bench-target ARG   覆盖默认基准目标（IP / CIDR，可空格分隔多个）
+  --bench-wan "CIDR"   真实外网标定：用你授权的目标段测出口上限（判据=网卡实发包数）
+  --wan-ports P        外网标定用的端口，默认 80,443,22
+  --bench-local        用本地保留段 192.0.2.0/24 + router-mac（默认，零外部流量）
+  --bench-rate PPS     前后对比用的固定速率，默认 min(公式值, 50000)
+  --bench-secs N       每档跑满的秒数，默认 3（发包量 = rate × N）
   --no-nic             跳过网卡层调优（虚拟机/容器环境）
   --report-md PATH     额外输出 Markdown 报告
   --restore            用最近一次备份回滚
   -h, --help           显示帮助
+
+基准说明:
+  默认直接对你的授权网段做真实标定（见脚本顶部 DEFAULT_BENCH_TARGET）。
+  想完全不发外部包，加 --bench-local 走 veth 隔离。
 EOF
 }
 
@@ -332,9 +367,15 @@ parse_args() {
       --skip-bench) SKIP_BENCH=1 ;;
       --no-nic)     NO_NIC=1 ;;
       --restore)    RESTORE=1 ;;
-      --bench-target) BENCH_TARGET="${2:-}"; shift ;;
+      --bench-target) BENCH_TARGET="${2:-auto}"; shift ;;
+      --bench-local)  BENCH_MODE="local" ;;
+      --bench-wan)    BENCH_WAN="${2:-}"; shift ;;
+      --wan-ports)    WAN_PORTS="${2:-80,443,22}"; shift ;;
+      --no-calibrate) CALIBRATE=0 ;;
+      --no-scan-sync) SCAN_SYNC=0 ;;
+      --scan-dir)     SCAN_DIR="${2:-/root/Scan}"; shift ;;
       --bench-rate)   BENCH_RATE="${2:-}"; shift ;;
-      --bench-secs)   BENCH_SECS="${2:-5}"; shift ;;
+      --bench-secs)   BENCH_SECS="${2:-3}"; shift ;;
       --bench-ports)  BENCH_PORTS="${2:-auto}"; shift ;;
       --report-md)    REPORT_MD="${2:-}"; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -353,8 +394,7 @@ require_root() {
     err "请以 root 运行: sudo $0 $*"
     exit 1
   fi
-  mkdir -p "$LOG_DIR" "$BACKUP_ROOT" 2>/dev/null || true
-  : >"$LOG_FILE" 2>/dev/null || LOG_FILE=""
+  mkdir -p "$BACKUP_ROOT" 2>/dev/null || true
 }
 
 # =============================================================================
@@ -397,6 +437,14 @@ detect_system() {
     CUR_CSTATE="n/a"
   fi
 
+  # 依赖自检：缺什么就降级什么，并提示安装命令
+  local missing=""
+  have ethtool   || missing="$missing ethtool"
+  have nft       || { have iptables || missing="$missing nftables"; }
+  have conntrack || missing="$missing conntrack"
+  have lscpu     || missing="$missing util-linux"
+  [ -n "$missing" ] && NOTES+=("缺失工具:$missing（apt install$missing）")
+
   have ethtool   && HAS_ETHTOOL=1
   have nft       && HAS_NFT=1
   have iptables  && HAS_IPT=1
@@ -414,7 +462,9 @@ detect_system() {
 
 detect_network() {
   info "探测网卡与链路…"
+  # 网卡探测三路兜底：ip route → /proc/net/route → /sys/class/net
   IFACE="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')"
+  [ -z "$IFACE" ] && IFACE="$(awk '$2=="00000000"{print $1;exit}' /proc/net/route 2>/dev/null)"
   [ -z "$IFACE" ] && IFACE="$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -1)"
   if [ -z "$IFACE" ]; then
     warn "未找到可用网卡，网卡层调优将跳过"
@@ -442,21 +492,36 @@ detect_network() {
   fi
   [ -z "$IF_SPEED" ] && IF_SPEED="unknown"
 
-  # 网关 MAC：ARP 表为空时主动 ping 一次把它"打"出来（--router-mac 是最大提速项）
+  # 网关 MAC：拿不到 --router-mac 时 masscan 要自己 ARP，会拖慢 10 倍以上
   if [ -n "$GW_IP" ]; then
-    gw_mac_lookup() {
-      local m
-      m="$(ip neigh show "$GW_IP" dev "$IFACE" 2>/dev/null | awk '/lladdr/{print $5;exit}')"
-      [ -z "$m" ] && m="$(arp -n "$GW_IP" 2>/dev/null | awk 'NR>1{print $3;exit}')"
-      printf '%s' "$m"
-    }
     GW_MAC="$(gw_mac_lookup)"
     if [ -z "$GW_MAC" ]; then
+      warn "网关 MAC 未解析，尝试主动触发 ARP…"
       ping -c 1 -W 1 "$GW_IP" >/dev/null 2>&1 || true
-      sleep 0.3
+      have arping && arping -c 1 -w 2 -I "$IFACE" "$GW_IP" >/dev/null 2>&1 || true
+      sleep 0.5
       GW_MAC="$(gw_mac_lookup)"
     fi
+    if [ -n "$GW_MAC" ]; then
+      ok "网关 MAC: $GW_MAC"
+    else
+      warn "网关 MAC 仍然取不到 —— 基准测试会因 masscan 自己 ARP 而严重偏慢，请手动指定 --router-mac"
+    fi
   fi
+
+}
+
+# 网关 MAC 多路探测
+gw_mac_lookup() {
+  local m=""
+  local bad="00:00:00:00:00:00"
+  m="$(ip neigh show "$GW_IP" dev "$IFACE" 2>/dev/null | awk '/lladdr/{print $5;exit}')"
+  [ -n "$m" ] && [ "$m" != "$bad" ] && { printf '%s' "$m"; return; }
+  m="$(awk -v ip="$GW_IP" '$1==ip{print $4;exit}' /proc/net/arp 2>/dev/null)"
+  [ -n "$m" ] && [ "$m" != "$bad" ] && { printf '%s' "$m"; return; }
+  m="$(arp -n "$GW_IP" 2>/dev/null | awk -v ip="$GW_IP" '$1==ip{print $3;exit}')"
+  [ -n "$m" ] && [ "$m" != "$bad" ] && { printf '%s' "$m"; return; }
+  printf ''
 }
 
 # =============================================================================
@@ -584,11 +649,11 @@ plan_nic() {
 
   # 环形缓冲：取硬件最大值，但不超过 4096（再大只增延迟不增吞吐）
   local gmax_rx gmax_tx
-  gmax_rx="$(ethtool -g "$IFACE" 2>/dev/null | awk -F: '/RX:|Pre-set maximums/{ } /^RX:/{gsub(/ /,"",$2);print $2;exit}')"
-  gmax_tx="$(ethtool -g "$IFACE" 2>/dev/null | awk -F: '/^TX:/{gsub(/ /,"",$2);print $2;exit}')"
+  gmax_rx="$(ethtool -g "$IFACE" 2>/dev/null | awk -F: '/^RX:/{gsub(/[^0-9]/,"",$2);print $2;exit}')"
+  gmax_tx="$(ethtool -g "$IFACE" 2>/dev/null | awk -F: '/^TX:/{gsub(/[^0-9]/,"",$2);print $2;exit}')"
   NIC_MAX_RX="${gmax_rx:-0}"; NIC_MAX_TX="${gmax_tx:-0}"
-  NIC_OLD_RX="$(ethtool -g "$IFACE" 2>/dev/null | awk -F: '/^RX:/{gsub(/ /,"",$2);print $2}' | sed -n '2p')"
-  NIC_OLD_TX="$(ethtool -g "$IFACE" 2>/dev/null | awk -F: '/^TX:/{gsub(/ /,"",$2);print $2}' | sed -n '2p')"
+  NIC_OLD_RX="$(ethtool -g "$IFACE" 2>/dev/null | awk -F: '/^RX:/{gsub(/[^0-9]/,"",$2);print $2}' | sed -n '2p')"
+  NIC_OLD_TX="$(ethtool -g "$IFACE" 2>/dev/null | awk -F: '/^TX:/{gsub(/[^0-9]/,"",$2);print $2}' | sed -n '2p')"
   NIC_OLD_RX="${NIC_OLD_RX:-0}"; NIC_OLD_TX="${NIC_OLD_TX:-0}"
 
   NIC_NEW_RX=4096; NIC_NEW_TX=4096
@@ -597,9 +662,9 @@ plan_nic() {
 
   # 队列：不超过物理核
   local q
-  q="$(ethtool -l "$IFACE" 2>/dev/null | awk -F: '/Pre-set maximums/{f=1;next} f&&/Combined/{gsub(/ /,"",$2);print $2;exit}')"
+  q="$(ethtool -l "$IFACE" 2>/dev/null | awk -F: '/Pre-set maximums/{f=1;next} f&&/Combined/{gsub(/[^0-9]/,"",$2);print $2;exit}')"
   NIC_MAX_Q="${q:-0}"
-  NIC_OLD_Q="$(ethtool -l "$IFACE" 2>/dev/null | awk -F: '/Current hardware settings/{f=1;next} f&&/Combined/{gsub(/ /,"",$2);print $2;exit}')"
+  NIC_OLD_Q="$(ethtool -l "$IFACE" 2>/dev/null | awk -F: '/Current hardware settings/{f=1;next} f&&/Combined/{gsub(/[^0-9]/,"",$2);print $2;exit}')"
   NIC_OLD_Q="${NIC_OLD_Q:-0}"
   NIC_NEW_Q="$CPU_PHYS"
   [ "$NIC_MAX_Q" -gt 0 ] 2>/dev/null && NIC_NEW_Q=$(clamp "$CPU_PHYS" 1 "$NIC_MAX_Q")
@@ -609,9 +674,15 @@ plan_nic() {
   NIC_NEW_TXQ=20000
 
   # offload 快照
-  local feat
-  for feat in gro lro gso tso sg tx; do
-    OFFLOAD_OLD["$feat"]="$(ethtool -k "$IFACE" 2>/dev/null | awk -v f="$feat:" '$1==f{print $2;exit}')"
+  local feat pat
+  for feat in gro lro gso tso; do
+    case "$feat" in
+      gro) pat="generic-receive-offload|rx-gro" ;;
+      lro) pat="large-receive-offload" ;;
+      gso) pat="generic-segmentation-offload" ;;
+      tso) pat="tcp-segmentation-offload" ;;
+    esac
+    OFFLOAD_OLD["$feat"]="$(ethtool -k "$IFACE" 2>/dev/null | awk -v p="$pat" -F: '(tolower($1) ~ p) {v=$2; gsub(/[^a-z]/,"",v); print v; exit}')"
     OFFLOAD_NEW["$feat"]="off"
   done
 }
@@ -634,8 +705,17 @@ plan_rate() {
   [ "$IF_VIRT" = "vm" ] && r=$(( r / 4 ))
   [ "$CPU_LOGICAL" -le 2 ] && r=$(( r / 2 ))
   [ "$r" -lt 10000 ] && r=10000
+
+  # 公式值仅作为"初值/上限保护"，真实值由 calibrate_rate 实测得出
+  RATE_FORMULA=$r
   RECOMMEND_RATE=$r
-  [ -z "$BENCH_RATE" ] && BENCH_RATE=$r
+
+  # 对比基准用固定中等速率，保证前后两次条件一致且包量可控
+  if [ -z "$BENCH_RATE" ]; then
+    BENCH_RATE=$r
+    [ "$BENCH_RATE" -gt 50000 ] && BENCH_RATE=50000
+    [ "$BENCH_RATE" -lt 1000 ]  && BENCH_RATE=1000
+  fi
 }
 
 print_plan() {
@@ -686,7 +766,7 @@ print_plan() {
 
   hr
   local spd="$IF_SPEED"; [ "$spd" = "unknown" ] || [ -z "$spd" ] && spd="未知"
-  printf '  %-16s %s pps（按链路 %s / %s 核推导）\n' "推荐 rate" "$RECOMMEND_RATE" "$spd" "$CPU_LOGICAL"
+  printf '  %-16s %s pps（公式初值，按链路 %s / %s 核推导；最终值由实测校准决定）\n' "推荐 rate" "$RATE_FORMULA" "$spd" "$CPU_LOGICAL"
   hr
 }
 
@@ -961,11 +1041,414 @@ nic_err() {
 }
 
 tx_packets() {
-  local f="/sys/class/net/${IFACE:-lo}/statistics/tx_packets"
+  local dev="${BENCH_IFACE:-$IFACE}"
+  [ -z "$dev" ] && dev="lo"
+  local f="/sys/class/net/${dev}/statistics/tx_packets"
   [ -r "$f" ] && cat "$f" || echo 0
 }
 
 # bench_run <tag> → 写全局变量 BENCH_<TAG>_*
+# ---- 隔离测试网络：veth 一对，包只在内核内走，绝不出本机 ----
+setup_bench_isolation() {
+  have ip || return 1
+  teardown_bench_isolation
+  ip netns add "$NETNS_NAME" 2>/dev/null || return 1
+  ip link add "${NS_LINK}0" type veth peer name "${NS_LINK}1" 2>/dev/null || {
+    ip netns del "$NETNS_NAME" 2>/dev/null; return 1; }
+  ip link set "${NS_LINK}1" netns "$NETNS_NAME" 2>/dev/null || return 1
+  ip addr add 198.18.0.1/24 dev "${NS_LINK}0" 2>/dev/null
+  ip link set "${NS_LINK}0" up 2>/dev/null
+  ip link set "${NS_LINK}0" txqueuelen 10000 2>/dev/null
+  ip netns exec "$NETNS_NAME" ip link set lo up 2>/dev/null
+  ip netns exec "$NETNS_NAME" ip link set "${NS_LINK}1" up 2>/dev/null
+  ip netns exec "$NETNS_NAME" ip link set "${NS_LINK}1" txqueuelen 10000 2>/dev/null
+  BENCH_IFACE="${NS_LINK}0"
+  BENCH_SRC_IP="198.18.0.1"
+  BENCH_SRC_MAC="$(cat "/sys/class/net/${NS_LINK}0/address" 2>/dev/null)"
+  BENCH_ROUTER_MAC="$(ip netns exec "$NETNS_NAME" cat "/sys/class/net/${NS_LINK}1/address" 2>/dev/null)"
+  [ -n "$BENCH_SRC_MAC" ] && [ -n "$BENCH_ROUTER_MAC" ] || { teardown_bench_isolation; return 1; }
+  return 0
+}
+
+teardown_bench_isolation() {
+  ip link del "${NS_LINK}0" 2>/dev/null
+  ip netns del "$NETNS_NAME" 2>/dev/null
+  return 0
+}
+
+# 解析 --bench-target："220.128.0.0/12 220.160.0.0/11" → 数组
+parse_bench_targets() {
+  local raw="$1" t
+  BENCH_TARGETS=()
+  for t in $raw; do
+    case "$t" in
+      *[!0-9./:]*) warn "忽略非法目标：$t"; continue ;;
+    esac
+    BENCH_TARGETS+=("$t")
+  done
+  [ "${#BENCH_TARGETS[@]}" -gt 0 ]
+}
+
+# ---- 基准目标：默认隔离，绝不碰真实网络 ----
+probe_bench_target() {
+  BENCH_IFACE="$IFACE"
+  # --bench-local 显式要求隔离时，忽略默认目标
+  [ "$BENCH_MODE" = "local" ] && BENCH_TARGET="auto"
+  BENCH_SRC_IP="$IF_IP"
+  BENCH_SRC_MAC="$IF_MAC"
+  BENCH_ROUTER_MAC="$GW_MAC"
+
+  if [ -n "$BENCH_TARGET" ] && [ "$BENCH_TARGET" != "auto" ]; then
+    BENCH_ISOLATED=0
+    BENCH_TARGET_SRC="用户指定(真实网卡)"
+    if ! parse_bench_targets "$BENCH_TARGET"; then
+      warn "目标段解析失败：${BENCH_TARGET}"
+      SKIP_BENCH=1
+      return 1
+    fi
+    BENCH_HOSTS=0
+    local t pp n
+    for t in "${BENCH_TARGETS[@]}"; do
+      case "$t" in
+        */*) pp="${t#*/}"; n=$(( 1 << (32 - pp) )) ;;
+        *)   n=1 ;;
+      esac
+      [ "$n" -gt "$BENCH_HOSTS" ] && BENCH_HOSTS=$n
+    done
+    [ "$BENCH_HOSTS" -lt 1 ] && BENCH_HOSTS=1
+    # 真实网段窗口放长：3 秒里 masscan 启动要占掉 0.5~1 秒，误差太大
+    [ "$BENCH_SECS" -eq 3 ] && BENCH_SECS=5
+    warn "将向 ${#BENCH_TARGETS[@]} 个目标段发送真实数据包：${BENCH_TARGETS[*]}"
+    warn "每档最多 ${BENCH_SECS} 秒（约 rate×${BENCH_SECS} 个包），确认是你的授权资产"
+    ok "基准目标：${BENCH_TARGETS[*]}（真实网卡 ${BENCH_IFACE}）"
+    return 0
+  fi
+
+  if setup_bench_isolation; then
+    BENCH_ISOLATED=1
+    BENCH_TARGET="198.18.0.0/24"
+    BENCH_TARGETS=("198.18.0.0/24")
+    BENCH_HOSTS=256
+    BENCH_TARGET_SRC="隔离 veth（包不出本机）"
+    ok "基准目标：${BENCH_TARGET}（隔离 veth ${BENCH_IFACE}，零外泄）"
+    return 0
+  fi
+
+  warn "无法创建隔离 veth（需要 root + netns 支持），跳过基准测试"
+  warn "如需实测，请显式指定：--bench-target 你自己的网段"
+  SKIP_BENCH=1
+}
+
+# ---- 单档探测：设定 rate 跑满 BENCH_SECS 秒，回填 PROBE_* ----
+# 原始探测数据写盘，便于事后逐条核对
+probe_log() {
+  local line="$*"
+  printf '%s\n' "$line" >>"${PROBE_LOG:-/dev/null}" 2>/dev/null || true
+}
+
+# ---- 单档探测：设定 rate 跑满 BENCH_SECS 秒，回填 PROBE_* ----
+# 全部原始计数都会写进 ${PROBE_LOG}，任何人都能拿笔算一遍验证
+bench_probe() {
+  local rate="$1"
+  PROBE_TX_PPS=0; PROBE_M_PPS=0; PROBE_DROP=0; PROBE_NICERR=0
+  PROBE_MS=0; PROBE_SENT=0; PROBE_RAW=""; PROBE_TX0=0; PROBE_TX1=0; PROBE_WALL=0
+
+  [ "$HAS_MASSCAN" -eq 1 ] || return 1
+  [ "$NO_NIC" -eq 0 ]      || return 1
+
+  local cap=$BENCH_MAX_PKTS
+  [ "${BENCH_ISOLATED:-0}" -eq 1 ] && cap=$BENCH_MAX_PKTS_ISO
+  local want=$(( rate * BENCH_SECS ))
+  [ "$want" -lt 6000 ] && want=6000
+  [ "$want" -gt "$cap" ] && want=$cap
+
+  local hosts=$BENCH_HOSTS
+  [ "$hosts" -lt 1 ] && hosts=1
+
+  local ports
+  if [ "$BENCH_PORTS" != "auto" ]; then
+    BENCH_PORTS_ACTUAL="$BENCH_PORTS"
+    case "$BENCH_PORTS" in
+      *-*) ports=$(( ${BENCH_PORTS#*-} - ${BENCH_PORTS%-*} + 1 )) ;;
+      *)   ports=1 ;;
+    esac
+  elif [ "${BENCH_ISOLATED:-0}" -eq 1 ]; then
+    # 隔离 veth：按包量反推端口，扫完自然结束
+    ports=$(( want / hosts ))
+    [ "$ports" -lt 1 ] && ports=1
+    [ "$ports" -gt 65535 ] && ports=65535
+    BENCH_PORTS_ACTUAL="1-${ports}"
+  else
+    # 真实网段：IP 数已经上百万，端口必须少，否则 masscan 调度开销会压垮发送速率
+    ports=10
+    BENCH_PORTS_ACTUAL="1-10"
+  fi
+  PROBE_SENT=$(( hosts * ports ))
+  [ "${BENCH_ISOLATED:-0}" -eq 0 ] && PROBE_SENT=$(( rate * BENCH_SECS ))
+
+  # --source-port 固定：避免内核 conntrack 建表，并与 nft notrack 规则对齐
+  local dev="${BENCH_IFACE:-$IFACE}"
+  local -a CMD=(masscan --interface "$dev")
+  [ -n "$BENCH_SRC_IP" ]     && CMD+=(--adapter-ip  "$BENCH_SRC_IP")
+  [ -n "$BENCH_SRC_MAC" ]    && CMD+=(--adapter-mac "$BENCH_SRC_MAC")
+  [ -n "$BENCH_ROUTER_MAC" ] && CMD+=(--router-mac  "$BENCH_ROUTER_MAC")
+  CMD+=(--source-port 40000 --rate "$rate" --retries 0 --wait 1
+        -p"$BENCH_PORTS_ACTUAL" "${BENCH_TARGETS[@]}" -oG /dev/null)
+
+  local cmd_str="" x
+  for x in "${CMD[@]}"; do cmd_str+="$(printf '%q' "$x") "; done
+
+  local tx0 tx1 drop0 drop1 nic0 nic1 t0 t1
+  tx0=$(tx_packets); drop0=$(softnet_drop); nic0=$(nic_err)
+  t0=$(date +%s%N)
+  timeout $(( BENCH_SECS + 8 )) bash -c "$cmd_str" >"${PROBE_RAWFILE:-/dev/null}" 2>&1 || true
+  t1=$(date +%s%N)
+  tx1=$(tx_packets); drop1=$(softnet_drop); nic1=$(nic_err)
+
+  local dtx=$(( tx1 - tx0 ))
+  local dms=$(( (t1 - t0) / 1000000 )); [ "$dms" -le 0 ] && dms=1
+  local send_ms=$dms
+  # 隔离模式 masscan 正常退出，末尾有 --wait 1 秒要扣掉；
+  # 真实网段模式靠 timeout 截断，根本没走到 wait，不能扣
+  [ "${BENCH_ISOLATED:-0}" -eq 1 ] && send_ms=$(( dms - 1000 ))
+  [ "$send_ms" -lt 500 ] && send_ms=$dms
+  PROBE_TX0=$tx0; PROBE_TX1=$tx1; PROBE_WALL=$dms; PROBE_MS=$send_ms
+  PROBE_DROP=$(( drop1 - drop0 ))
+  PROBE_NICERR=$(( nic1 - nic0 ))
+  PROBE_REAL_PPS=$(( dtx * 1000 / send_ms ))   # 网卡实发：真实网卡上唯一可信的指标
+  PROBE_TX_PPS=$PROBE_REAL_PPS
+
+  # masscan 用回车符刷新同一行，且 --wait 阶段全是 0.00-kpps。
+  # 必须 tr 转换 + grep -a（输出含二进制字节）+ 取全序列最大值，绝不能取最后一行。
+  if [ -n "${PROBE_RAWFILE:-}" ] && [ -r "$PROBE_RAWFILE" ]; then
+    PROBE_RAW="$(tr '\r' '\n' <"$PROBE_RAWFILE" | grep -a 'rate:' | tail -1)"
+    local maxk
+    maxk="$(tr '\r' '\n' <"$PROBE_RAWFILE" | grep -a -oE 'rate:[ ]*[0-9]+\.[0-9]+-kpps' | grep -a -oE '[0-9]+\.[0-9]+' | sort -rn | head -1)"
+    [ -n "$maxk" ] && PROBE_M_PPS=$(awk -v r="$maxk" 'BEGIN{printf "%d", r*1000}')
+    PROBE_FOUND="$(tr '\r' '\n' <"$PROBE_RAWFILE" | grep -a -oE 'found=[0-9]+' | tail -1 | cut -d= -f2)"
+  fi
+
+  probe_log "$(printf 'rate=%-8s sent=%-8s tx0=%-12s tx1=%-12s dtx=%-8s wall_ms=%-7s self_pps=%-8s found=%s'       "$rate" "$PROBE_SENT" "$tx0" "$tx1" "$dtx" "$dms" "$PROBE_M_PPS" "${PROBE_FOUND:-?}")"
+  probe_log "  cmd: ${cmd_str}"
+  return 0
+}
+
+# ---- 阶梯实测：找这台机器真实能跑多少 pps ----
+calibrate_rate() {
+  if [ "$HAS_MASSCAN" -ne 1 ] || [ "$NO_NIC" -eq 1 ]; then
+    warn "缺少 masscan 或无网卡，跳过 rate 校准"
+    return 0
+  fi
+  hr
+  info "阶梯实测校准 rate（目标 ${BENCH_TARGET}，${BENCH_TARGET_SRC}）"
+  [ -n "$GW_MAC" ] || warn "网关 MAC 缺失"
+  info "原始数据: ${PROBE_LOG}"
+  hr
+
+  local lv got lo hi mid i gain=0 prev_got=0
+  local levels="4000 8000 16000 32000 64000 128000 256000 512000 1000000"
+  # 真实网段：段太大扫不完，靠 timeout 截断，档位精简避免流量过大
+  [ "${BENCH_ISOLATED:-0}" -eq 0 ] && levels="4000 8000 16000 32000 64000 128000"
+
+  local last_good=0 fail_at=0 ceiling=0
+  # veth 对端没有消费者，前一轮大批量会在队列里积压，先等它排空
+  [ "${BENCH_ISOLATED:-0}" -eq 1 ] && sleep 2
+  for lv in $levels; do
+    bench_probe "$lv"
+    # 隔离 veth：对端无消费者，墙钟会被积压拖长，用 masscan 自报值更准
+    # 真实网卡：自报虚高 30%，必须用网卡实发
+    if [ "${BENCH_ISOLATED:-0}" -eq 1 ]; then
+      got=$PROBE_M_PPS
+      [ "$got" -lt 1 ] && got=$PROBE_REAL_PPS
+    else
+      if [ "${BENCH_ISOLATED:-0}" -eq 1 ]; then
+        got=$PROBE_M_PPS
+        [ "$got" -lt 1 ] && got=$PROBE_REAL_PPS
+      else
+        got=$PROBE_REAL_PPS
+        [ "$got" -lt 1 ] && got=$PROBE_M_PPS
+      fi
+    fi
+    if [ "$got" -lt 1 ]; then
+      CAL_ROWS+=("${lv}|0|0%|❌ 无出包")
+      warn "档位 ${lv} 完全无出包，校准中止"
+      break
+    fi
+    local ach=$(( got * 100 / lv ))
+    [ "$got" -gt "$ceiling" ] && ceiling=$got
+
+    if [ "${BENCH_ISOLATED:-0}" -eq 0 ]; then
+      # 真实网段：达成率天然到不了 95%，看"加大设定值后实发还涨不涨"
+      if [ "$prev_got" -gt 0 ]; then
+        gain=$(( (got - prev_got) * 100 / prev_got ))
+      else
+        gain=999
+      fi
+      if [ "$prev_got" -gt 0 ] && [ "$gain" -lt 10 ]; then
+        CAL_ROWS+=("${lv}|${got}|${ach}%|⚠️ 饱和 ${gain}%")
+        printf '    粗扫 %-8s pps  →  实发 %-8s (%s%%)  较上档 %s%%  ← 饱和\n' "$lv" "$got" "$ach" "$gain"
+        fail_at=$lv
+        break
+      fi
+      CAL_ROWS+=("${lv}|${got}|${ach}%|✅ 增长 ${gain}%")
+      printf '    粗扫 %-8s pps  →  实发 %-8s (%s%%)  较上档 +%s%%\n' "$lv" "$got" "$ach" "$gain"
+      prev_got=$got
+      last_good=$lv
+    elif [ "$ach" -ge 95 ]; then
+      CAL_ROWS+=("${lv}|${got}|${ach}%|✅ 达成")
+      printf '    粗扫 %-8s pps  →  实测 %-8s (%s%%)\n' "$lv" "$got" "$ach"
+      last_good=$lv
+    else
+      CAL_ROWS+=("${lv}|${got}|${ach}%|⚠️ 饱和")
+      printf '    粗扫 %-8s pps  →  实测 %-8s (%s%%)  ← 已饱和\n' "$lv" "$got" "$ach"
+      fail_at=$lv
+      break
+    fi
+    sleep 1
+  done
+
+  # 真实网段：推荐值 = 实发峰值 × 80%，向下取整到千位
+  # 绝不能把"设定值"当推荐值 —— 那会高于机器实际能跑的吞吐
+  if [ "${BENCH_ISOLATED:-0}" -eq 0 ]; then
+    RATE_MEASURED=$ceiling
+    if [ "$ceiling" -gt 0 ]; then
+      RECOMMEND_RATE=$(( ceiling * 80 / 100 ))
+      RECOMMEND_RATE=$(( RECOMMEND_RATE / 1000 * 1000 ))
+      [ "$RECOMMEND_RATE" -lt 1000 ] && RECOMMEND_RATE=1000
+      ok "实发峰值 ${ceiling} pps → 推荐 rate = ${RECOMMEND_RATE} pps（峰值 -20%，向下取整到千位）"
+    else
+      warn "无有效实发数据，保留公式初值 ${RATE_FORMULA} pps"
+      RECOMMEND_RATE=$RATE_FORMULA
+    fi
+    return 0
+  fi
+
+  # 隔离 veth：继续二分，把推荐值逼到 masscan 发送能力上限
+  if [ "$last_good" -gt 0 ] && [ "$fail_at" -gt 0 ] && [ "$fail_at" -gt "$last_good" ]; then
+    lo=$last_good
+    hi=$fail_at
+    for i in 1 2 3 4 5; do
+      [ $(( hi - lo )) -le 300 ] && break
+      mid=$(( (lo + hi) / 2 ))
+      bench_probe "$mid"
+      if [ "${BENCH_ISOLATED:-0}" -eq 1 ]; then
+        got=$PROBE_M_PPS
+        [ "$got" -lt 1 ] && got=$PROBE_REAL_PPS
+      else
+        got=$PROBE_REAL_PPS
+        [ "$got" -lt 1 ] && got=$PROBE_M_PPS
+      fi
+      local m_ach=$(( got * 100 / mid ))
+      if [ "$m_ach" -ge 95 ]; then
+        CAL_ROWS+=("${mid}|${got}|${m_ach}%|🔍 细调·达成")
+        printf '    细调 %-8s pps  →  实测 %-8s (%s%%)  收窄到 (%s, %s]\n' "$mid" "$got" "$m_ach" "$mid" "$hi"
+        lo=$mid
+      else
+        CAL_ROWS+=("${mid}|${got}|${m_ach}%|🔍 细调·未达")
+        printf '    细调 %-8s pps  →  实测 %-8s (%s%%)  收窄到 (%s, %s]\n' "$mid" "$got" "$m_ach" "$lo" "$mid"
+        hi=$mid
+      fi
+      sleep 0.2
+    done
+  elif [ "$last_good" -gt 0 ] && [ "$fail_at" -eq 0 ]; then
+    lo=$last_good
+    warn "粗扫已达 1000000 pps 仍全程达成，masscan 单线程基本到此为止"
+  else
+    lo=0
+  fi
+
+  RATE_MEASURED=$lo
+  if [ "$RATE_MEASURED" -gt 0 ]; then
+    RECOMMEND_RATE=$RATE_MEASURED
+    ok "实测上限 ${RATE_MEASURED} pps → 推荐 rate = ${RECOMMEND_RATE} pps（这就是本机 masscan 的实测天花板）"
+  else
+    warn "无法测出有效吞吐，保留公式初值 ${RATE_FORMULA} pps"
+    RECOMMEND_RATE=$RATE_FORMULA
+  fi
+}
+
+# ---- 真实外网扫描能力标定（用你授权的目标段，指标取网卡实际发出的包）----
+wan_probe() {
+  local rate="$1" target="$2"
+  WAN_REAL_PPS=0; WAN_SELF_PPS=0; WAN_MBPS=0; WAN_FOUND=0
+
+  local tx0 t0 tx1 t1 by0 by1
+  tx0=$(tx_packets); by0=$(cat "/sys/class/net/${BENCH_IFACE}/statistics/tx_bytes" 2>/dev/null || echo 0)
+  t0=$(date +%s%N)
+  timeout "$WAN_DUR" masscan --interface "$BENCH_IFACE" \
+      --rate "$rate" --retries 0 --wait 1 --randomize-hosts \
+      -p"$WAN_PORTS" $target -oG /dev/null >"${PROBE_RAWFILE:-/dev/null}" 2>&1 || true
+  t1=$(date +%s%N)
+  tx1=$(tx_packets); by1=$(cat "/sys/class/net/${BENCH_IFACE}/statistics/tx_bytes" 2>/dev/null || echo 0)
+
+  local dp=$(( tx1 - tx0 )) db=$(( by1 - by0 ))
+  local ms=$(( (t1 - t0) / 1000000 )); [ "$ms" -lt 1 ] && ms=1
+  local send=$(( ms - 1000 )); [ "$send" -lt 1000 ] && send=$ms
+
+  WAN_REAL_PPS=$(( dp * 1000 / send ))
+  WAN_MBPS=$(awk -v b="$db" -v s="$send" 'BEGIN{printf "%.1f", b*8/1000000/(s/1000)}')
+
+  local s
+  s=$(tr '\r' '\n' <"${PROBE_RAWFILE:-/dev/null}" 2>/dev/null \
+      | grep -a -oE 'rate:[ ]*[0-9]+\.[0-9]+-kpps' | grep -a -oE '[0-9]+\.[0-9]+' | sort -rn | head -1)
+  [ -n "$s" ] && WAN_SELF_PPS=$(awk -v r="$s" 'BEGIN{printf "%d", r*1000}')
+  WAN_FOUND=$(tr '\r' '\n' <"${PROBE_RAWFILE:-/dev/null}" 2>/dev/null | grep -a -oE 'found=[0-9]+' | tail -1 | cut -d= -f2)
+
+  probe_log "WAN rate=$rate real=$WAN_REAL_PPS self=$WAN_SELF_PPS mbps=$WAN_MBPS found=${WAN_FOUND:-0}"
+  return 0
+}
+
+calibrate_wan() {
+  local targets="$1"
+  hr
+  info "外网扫描能力标定（目标段：${targets}，端口 ${WAN_PORTS}，每档 ${WAN_DUR}s × 3 次取中位数）"
+  warn "真实外发流量，确认目标段是你的授权资产"
+  hr
+
+  local levels="10000 15000 20000 25000 30000 40000 50000 60000 80000 100000"
+  local lv r best max_real=0 argmax_rate=0
+  local -a RATES=() REALS=()
+
+  for lv in $levels; do
+    # 每档跑 3 次取中位数：单次方差可达 ±20%，最大值会系统性高估
+    local -a v=()
+    for r in 1 2 3; do
+      wan_probe "$lv" "$targets"
+      v+=("$WAN_REAL_PPS")
+      [ "$r" -lt 3 ] && sleep 1
+    done
+    best=$(printf '%s
+' "${v[@]}" | sort -n | sed -n '2p')
+    [ -z "$best" ] && best=0
+    RATES+=("$lv"); REALS+=("$best")
+    printf '    %-8s pps → 实发 %-8s pps (%.1f Mbps)
+' "$lv" "$best" "$WAN_MBPS"
+    CAL_ROWS+=("${lv}|${best}|-|实发")
+    [ "$best" -gt "$max_real" ] && { max_real=$best; argmax_rate=$lv; }
+    sleep 1
+  done
+
+  # 平台期判定：实发达到峰值 95% 的最小设定值，才是可用的 rate
+  local thr=$(( max_real * 95 / 100 )) rec=0 i
+  for i in "${!RATES[@]}"; do
+    if [ "${REALS[$i]}" -ge "$thr" ]; then rec="${RATES[$i]}"; break; fi
+  done
+
+  hr
+  printf '  峰值实发 %s pps（出现在设定 %s 档）
+' "$max_real" "$argmax_rate"
+  if [ "$rec" -gt 0 ]; then
+    RATE_MEASURED=$max_real
+    RECOMMEND_RATE=$rec
+    ok "外网扫描上限 ${max_real} pps ｜ 达到该上限 95% 的最小设定值 = ${rec} pps"
+    ok "推荐 rate = ${RECOMMEND_RATE} pps（再往上加设定值，实发不再增长）"
+  else
+    warn "标定失败，保留公式初值 ${RATE_FORMULA} pps"
+    RECOMMEND_RATE=$RATE_FORMULA
+  fi
+}
+
+# ---- 调优前后对比（同 rate、同目标、同端口） ----
 bench_run() {
   local tag="$1"
   local up
@@ -982,196 +1465,166 @@ bench_run() {
     return 0
   fi
 
-  # 计算包量，让运行时长接近 BENCH_SECS
   BENCH_RATE="${BENCH_RATE//[^0-9]/}"
-  [ -z "$BENCH_RATE" ] && BENCH_RATE=100000
+  [ -z "$BENCH_RATE" ] && BENCH_RATE=10000
   BENCH_SECS="${BENCH_SECS//[^0-9]/}"
-  [ -z "$BENCH_SECS" ] && BENCH_SECS=5
+  [ -z "$BENCH_SECS" ] && BENCH_SECS=3
 
-  local ports_n=2000
-  local rate=$BENCH_RATE
-  local hosts=256
-  local total expect
+  info "基准测试(${tag}): rate=${BENCH_RATE}pps target=${BENCH_TARGET} 预算 ${BENCH_SECS}s"
 
-  if [ "$BENCH_PORTS" = "auto" ]; then
-    # 反推端口数：让"包量 / rate ≈ BENCH_SECS"，保证小机器不跑太久、大机器不致于太短
-    ports_n=$(( rate * BENCH_SECS / hosts ))
-    [ "$ports_n" -lt 1 ] && ports_n=1
-    [ "$ports_n" -gt 65535 ] && ports_n=65535
-    BENCH_PORTS_ACTUAL="1-${ports_n}"
-  else
-    case "$BENCH_PORTS" in
-      *-*) ports_n=$(( ${BENCH_PORTS#*-} - ${BENCH_PORTS%-*} + 1 )) ;;
-      *,*) ports_n=$(printf '%s' "$BENCH_PORTS" | awk -F, '{print NF}') ;;
-      *)   ports_n=1 ;;
-    esac
-    if ! [[ "${ports_n:-}" =~ ^[0-9]+$ ]] || [ "$ports_n" -lt 1 ]; then ports_n=2000; fi
-    BENCH_PORTS_ACTUAL="$BENCH_PORTS"
-  fi
+  # 只用 masscan 自报速率：tx_packets 在 veth/NAT 上会被 ARP、阻塞、其他流量污染
+  # 跑两次取大值，压掉单次抖动（veth 尤其明显）
+  local got=0 r
+  for r in 1 2; do
+    bench_probe "$BENCH_RATE"
+    local one=$PROBE_REAL_PPS
+    if [ "${BENCH_ISOLATED:-0}" -eq 1 ]; then
+      one=$PROBE_M_PPS
+      [ "$one" -lt 1 ] && one=$PROBE_REAL_PPS
+    fi
+    [ "$one" -lt 1 ] && one=$PROBE_TX_PPS
+    [ "$one" -gt "$got" ] && got=$one
+    [ "$got" -gt 0 ] && [ "$r" -eq 1 ] && sleep 0.3
+  done
+  printf -v "BENCH_${up}_PPS"    '%s' "$got"
+  printf -v "BENCH_${up}_DROP"   '%s' "$PROBE_DROP"
+  printf -v "BENCH_${up}_NICERR" '%s' "$PROBE_NICERR"
 
-  total=$(( hosts * ports_n ))
-  expect=$(( total / (rate>0?rate:1) ))
-  [ "$expect" -lt 1 ] && expect=1
-  [ "$expect" -gt 120 ] && expect=120
+  local ach=$(( BENCH_RATE > 0 ? got * 100 / BENCH_RATE : 0 ))
+  printf -v "BENCH_${up}_ACH" '%s' "$ach"
 
-  info "基准测试(${tag}): rate=${rate}pps target=${BENCH_TARGET} ports=${BENCH_PORTS_ACTUAL} 预计 ${expect}s"
-
-  local tx0 tx1 t0 t1 pps drop0 drop1 nic0 nic1
-  tx0=$(tx_packets); drop0=$(softnet_drop); nic0=$(nic_err)
-  t0=$(date +%s%N)
-
-  timeout $(( expect + 30 )) \
-    masscan --interface "$IFACE" \
-            --rate "$rate" --retries 0 --wait 1 --nostatus \
-            -p"${BENCH_PORTS_ACTUAL}" "$BENCH_TARGET" \
-            -oG /dev/null >/dev/null 2>&1
-  local rc=$?
-
-  t1=$(date +%s%N)
-  tx1=$(tx_packets); drop1=$(softnet_drop); nic1=$(nic_err)
-
-  local dtx=$(( tx1 - tx0 ))
-  local dns=$(( (t1 - t0) / 1000000 ))
-  [ "$dns" -le 0 ] && dns=1
-  pps=$(( dtx * 1000 / dns ))
-
-  printf -v "BENCH_${up}_PPS"   '%s' "$pps"
-  printf -v "BENCH_${up}_DROP"  '%s' "$(( drop1 - drop0 ))"
-  printf -v "BENCH_${up}_NICERR" '%s' "$(( nic1 - nic0 ))"
-  local ach=$(( rate > 0 ? pps * 100 / rate : 0 ))
-  printf -v "BENCH_${up}_ACH"   '%s' "$ach"
-
-  if [ "$rc" -eq 124 ]; then
-    warn "基准测试超时（可能被防火墙/路由拦截）"
+  if [ "$got" -lt 1 ]; then
+    warn "基准(${tag}): 网卡零出包 —— 目标不可达或网关 MAC 未解析，本次数据无效"
     printf -v "BENCH_${up}_OK" '%s' 0
+    BENCH_INVALID=1
   else
     printf -v "BENCH_${up}_OK" '%s' 1
   fi
-  ok "基准(${tag}): 实测 ${pps} pps / 目标 ${rate} pps = 达成 ${ach}% | 内核丢包 +$((drop1-drop0)) | 网卡错误 +$((nic1-nic0))"
+  ok "基准(${tag}): masscan 自报 ${got} pps / 设定 ${BENCH_RATE} pps = 达成 ${ach}% | 发包 ${PROBE_SENT} 个 | tx增量 +$(( PROBE_TX1 - PROBE_TX0 )) | 内核丢包 +${PROBE_DROP}"
 }
 
 # =============================================================================
 #  阶段六：报告
 # =============================================================================
 report() {
+  # 控制台只打结论摘要；完整 Markdown 报告仅在你显式 --report-md 时才生成
   local md="${REPORT_MD}"
-  if [ -z "$md" ] && [ -d "$LOG_DIR" ]; then md="${LOG_DIR}/report-${TS}.md"; fi
-  : >"$md" 2>/dev/null || md=""
+  local quiet=1
+  if [ -n "$md" ]; then
+    : >"$md" 2>/dev/null || md=""
+    [ -n "$md" ] && quiet=0
+  fi
 
   emit() {
-    printf '%s\n' "$*"
-    [ -n "$md" ] && printf '%s\n' "$*" >>"$md"
+    [ "$quiet" -eq 0 ] && printf '%s\n' "$*" >>"$md"
+    return 0
   }
 
-  emit ""
-  emit "# masscan 调优报告"
-  emit ""
-  emit "- 生成时间：$(date '+%Y-%m-%d %H:%M:%S %Z')"
-  emit "- 脚本版本：v${SCRIPT_VER}   模式：${MODE}"
-  emit "- 主机：${DISTRO} / ${KERNEL} / ${ARCH}"
-  emit "- CPU：${CPU_MODEL}（${CPU_LOGICAL} 逻辑核 / ${CPU_PHYS} 物理核）"
-  emit "- 内存：${MEM_TOTAL_MB} MB"
-  if [ "$NO_NIC" -eq 0 ]; then
-    emit "- 网卡：${IFACE}（${IF_DRIVER}，$([ "$IF_SPEED" = "unknown" ] && echo "速率未知" || echo "${IF_SPEED}M")，MTU ${IF_MTU}，IP ${IF_IP:-none}）"
-  fi
-  emit "- masscan：$([ "$HAS_MASSCAN" -eq 1 ] && echo "${MASSCAN_VER}" || echo "未安装")  PF_RING：$([ "$HAS_PFRING" -eq 1 ] && echo yes || echo no)"
-  emit ""
-
-  # ---- 1. 参数变更 ----
-  emit "## 一、参数变更明细"
-  emit ""
-  emit "| 参数 | 优化前 | 优化后 | 状态 |"
-  emit "|---|---|---|---|"
-  local k st
-  for k in $(printf '%s\n' "${!SYSCTL_NEW[@]}" | sort); do
-    st="${SYSCTL_RESULT[$k]:-pending}"
-    case "$st" in
-      ok)   st="✅ 生效" ;;
-      fail) st="⚠️ 写入失败" ;;
-      skip) st="— 内核不支持" ;;
-      keep) st="· 已达标" ;;
-      *)    st="· 未执行" ;;
-    esac
-    emit "| \`$k\` | \`${SYSCTL_OLD[$k]}\` | \`${SYSCTL_NEW[$k]}\` | $st |"
-  done
-  emit ""
-
-  if [ "$NO_NIC" -eq 0 ]; then
-    emit "## 二、网卡层变更"
+  if [ "$quiet" -eq 0 ]; then
+    emit "# masscan 调优报告"
     emit ""
-    emit "| 项目 | 优化前 | 优化后 |"
-    emit "|---|---|---|"
-    emit "| RX ring | ${NIC_OLD_RX} | ${NIC_NEW_RX} |"
-    emit "| TX ring | ${NIC_OLD_TX} | ${NIC_NEW_TX} |"
-    emit "| Combined 队列 | ${NIC_OLD_Q} | ${NIC_NEW_Q:-保持} |"
-    emit "| txqueuelen | ${NIC_OLD_TXQ} | ${NIC_NEW_TXQ} |"
-    emit "| GRO / LRO / GSO / TSO | ${OFFLOAD_OLD[gro]:-?} / ${OFFLOAD_OLD[lro]:-?} / ${OFFLOAD_OLD[gso]:-?} / ${OFFLOAD_OLD[tso]:-?} | off / off / off / off |"
-    emit "| 中断合并 | 默认 | rx-usecs 0 / 自适应关闭 |"
-    [ "$IRQ_BOUND" -gt 0 ] && emit "| 中断绑核 | irqbalance 托管 | ${IRQ_BOUND} 个 IRQ 手工绑定 |"
+    emit "- 生成时间：$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    emit "- 主机：${DISTRO} / ${KERNEL} / ${ARCH}"
+    emit "- CPU：${CPU_MODEL}（${CPU_LOGICAL} 逻辑核 / ${CPU_PHYS} 物理核），内存 ${MEM_TOTAL_MB} MB"
+    [ "$NO_NIC" -eq 0 ] && emit "- 网卡：${IFACE}（${IF_DRIVER}，IP ${IF_IP:-none}）"
     emit ""
-  fi
 
-  emit "## 三、执行动作"
-  emit ""
-  local row a b c
-  for row in "${ACTION_ROWS[@]}"; do
-    IFS='|' read -r a b c <<<"$row"
-    emit "- **${a}** → ${b}：${c}"
-  done
-  emit ""
-
-  # ---- 2. 效果 ----
-  emit "## 四、优化效果（实测）"
-  emit ""
-  if [ "$SKIP_BENCH" -eq 1 ]; then
-    emit "> 已通过 --skip-bench 跳过发型基准，本节无数据。"
-  elif [ "$HAS_MASSCAN" -ne 1 ]; then
-    emit "> 未安装 masscan，无法测量实际发包能力。"
-  elif [ "$BENCH_BEFORE_OK" -eq 0 ] || [ "$BENCH_AFTER_OK" -eq 0 ]; then
-    emit "> 基准测试未能完成（目标不可达 / 无出网权限）。以下为过程数据："
+    emit "## 一、参数变更"
     emit ""
-    emit "| 阶段 | 实测 pps | 内核丢弃 | 网卡错误 |"
+    emit "| 参数 | 优化前 | 优化后 | 状态 |"
     emit "|---|---|---|---|"
-    emit "| 优化前 | ${BENCH_BEFORE_PPS} | +${BENCH_BEFORE_DROP} | +${BENCH_BEFORE_NICERR} |"
-    emit "| 优化后 | ${BENCH_AFTER_PPS} | +${BENCH_AFTER_DROP} | +${BENCH_AFTER_NICERR} |"
-  else
-    local delta=0 pct=0
-    delta=$(( BENCH_AFTER_PPS - BENCH_BEFORE_PPS ))
-    [ "$BENCH_BEFORE_PPS" -gt 0 ] && pct=$(( delta * 100 / BENCH_BEFORE_PPS ))
+    local k st
+    for k in $(printf '%s\n' "${!SYSCTL_NEW[@]}" | sort); do
+      st="${SYSCTL_RESULT[$k]:-pending}"
+      case "$st" in
+        ok) st="生效" ;; fail) st="写入失败" ;; skip) st="内核不支持" ;;
+        keep) st="已达标" ;; *) st="未执行" ;;
+      esac
+      emit "| \`$k\` | \`${SYSCTL_OLD[$k]}\` | \`${SYSCTL_NEW[$k]}\` | $st |"
+    done
+    emit ""
 
-    emit "测试条件：目标 \`${BENCH_TARGET}\`，端口 \`${BENCH_PORTS_ACTUAL:-$BENCH_PORTS}\`，设定 rate \`${BENCH_RATE}\` pps，\`--retries 0\`，统计网卡 tx_packets 增量。"
+    emit "## 二、实测"
     emit ""
-    emit "| 指标 | 优化前 | 优化后 | 变化 |"
-    emit "|---|---|---|---|"
-    emit "| 实测发包速率 | **${BENCH_BEFORE_PPS} pps** | **${BENCH_AFTER_PPS} pps** | ${delta} pps（${pct}%） |"
-    emit "| 达成率（实测/设定） | ${BENCH_BEFORE_ACH}% | ${BENCH_AFTER_ACH}% | $(( BENCH_AFTER_ACH - BENCH_BEFORE_ACH )) pt |"
-    emit "| 内核 softnet 丢弃 | +${BENCH_BEFORE_DROP} | +${BENCH_AFTER_DROP} | $(( BENCH_AFTER_DROP - BENCH_BEFORE_DROP )) |"
-    emit "| 网卡侧错误/丢弃 | +${BENCH_BEFORE_NICERR} | +${BENCH_AFTER_NICERR} | $(( BENCH_AFTER_NICERR - BENCH_BEFORE_NICERR )) |"
-    emit ""
-    if [ "$pct" -gt 0 ]; then
-      emit "**结论：同等设定 rate 下，实际落地吞吐提升 ${pct}%。**"
-    elif [ "$pct" -eq 0 ]; then
-      emit "**结论：吞吐未变化 —— 说明瓶颈不在内核/网卡层，而在单线程发包或链路本身，需要 --shard 多实例。**"
-    else
-      emit "**结论：吞吐下降 —— 请检查是否 rate 设得过高导致回包路径拥塞，降低 rate 通常结果更多。**"
+    if [ "${#CAL_ROWS[@]}" -gt 0 ]; then
+      emit "| 设定 rate | 实发 pps | 达成率 | 判定 |"
+      emit "|---|---|---|---|"
+      local row a b c d
+      for row in "${CAL_ROWS[@]}"; do
+        IFS='|' read -r a b c d <<<"$row"
+        emit "| ${a} | ${b} | ${c} | ${d} |"
+      done
+      emit ""
     fi
-  fi
-  emit ""
-
-  # ---- 3. 注意事项 ----
-  if [ "${#NOTES[@]}" -gt 0 ]; then
-    emit "## 五、注意事项"
-    emit ""
-    local n
-    for n in "${NOTES[@]}"; do emit "- $n"; done
+    emit "推荐 rate：\`${RECOMMEND_RATE}\` pps"
     emit ""
   fi
 
-  emit "---"
-  emit "回滚：\`sudo $0 --restore\`（备份目录 ${BACKUP_DIR}）"
-  emit ""
+  # 控制台摘要
+  return 0
+}
 
-  [ -n "$md" ] && printf '%s报告已保存: %s%s\n' "$C_G" "$md" "$C_0"
+# 按实测速率推导 --wait：速率越低给越长的收包窗口，下限 3 秒、上限 10 秒
+calc_wait() {
+  local r="$1" w
+  [ "$r" -lt 1 ] && r=1
+  w=$(( 150000 / r ))
+  [ "$w" -lt 3 ]  && w=3
+  [ "$w" -gt 10 ] && w=10
+  printf '%s' "$w"
+}
+
+# ---- 把实测推荐值写回 Scan.sh 的 --max-rate ----
+sync_scan_script() {
+  [ "$SCAN_SYNC" -eq 1 ] || return 0
+  # 只有校准真正测出结果才写回，公式兜底值不写
+  [ "${RATE_MEASURED:-0}" -gt 0 ] || { info "未测出有效上限，跳过 Scan.sh 同步"; return 0; }
+
+  local dir="${SCAN_DIR}" sh cur now wait_cur wait_new
+  sh="${dir}/Scan.sh"
+  [ -d "$dir" ] || return 0
+  [ -f "$sh" ]  || { info "未找到 ${sh}，跳过同步"; return 0; }
+
+  cur=$(grep -aoE -- '--max-rate[[:space:]]+[0-9]+' "$sh" 2>/dev/null | head -1 | grep -oE '[0-9]+$')
+  if [ -z "$cur" ]; then
+    warn "${sh} 里没有 --max-rate 参数，跳过"
+    return 0
+  fi
+  wait_cur=$(grep -aoE -- '--wait[[:space:]]+[0-9]+' "$sh" 2>/dev/null | head -1 | grep -oE '[0-9]+$')
+  wait_new=$(calc_wait "$RECOMMEND_RATE")
+
+  # 两个参数都已经是目标值才跳过；只对上其中一个不能算完成
+  if [ "$cur" = "$RECOMMEND_RATE" ] && { [ -z "$wait_cur" ] || [ "$wait_cur" = "$wait_new" ]; }; then
+    ok "${sh} 已是目标值（--max-rate ${cur}$([ -n "$wait_cur" ] && echo "，--wait $wait_cur")），无需修改"
+    return 0
+  fi
+
+  # 变化过大时提示：多半是链路状态波动，不是机器变了
+  local hi=$cur lo=$cur
+  [ "$RECOMMEND_RATE" -gt "$cur" ] && hi=$RECOMMEND_RATE || lo=$RECOMMEND_RATE
+  if [ "$lo" -gt 0 ] && [ $(( hi / lo )) -ge 5 ]; then
+    warn "新值 ${RECOMMEND_RATE} 与原值 ${cur} 相差 ${hi}:${lo}，可能是链路波动，建议复核"
+  fi
+
+  cp -a "$sh" "/tmp/Scan.sh.bak.${TS}" 2>/dev/null || true
+  [ "$cur" != "$RECOMMEND_RATE" ] && \
+    sed -i -E "s/--max-rate[[:space:]]+[0-9]+/--max-rate ${RECOMMEND_RATE}/g" "$sh" 2>/dev/null
+  if [ -n "$wait_cur" ] && [ "$wait_cur" != "$wait_new" ]; then
+    sed -i -E "s/--wait[[:space:]]+[0-9]+/--wait ${wait_new}/g" "$sh" 2>/dev/null
+  fi
+
+  now=$(grep -aoE -- '--max-rate[[:space:]]+[0-9]+' "$sh" 2>/dev/null | head -1 | grep -oE '[0-9]+$')
+  if [ "$now" = "$RECOMMEND_RATE" ]; then
+    local msg=""
+    [ "$cur" != "$RECOMMEND_RATE" ] && msg="--max-rate ${cur} → ${RECOMMEND_RATE}"
+    if [ -n "$wait_cur" ] && [ "$wait_cur" != "$wait_new" ]; then
+      [ -n "$msg" ] && msg="${msg}，"
+      msg="${msg}--wait ${wait_cur} → ${wait_new}"
+    fi
+    ok "已更新 ${sh}：${msg}"
+  else
+    warn "写入 ${sh} 失败（当前 ${now:-未知}）"
+  fi
 }
 
 # =============================================================================
@@ -1259,12 +1712,30 @@ BANNER
     exit 0
   fi
 
+  PROBE_LOG="/tmp/.masscan-tune-probe-${TS}.log"
+  : >"$PROBE_LOG" 2>/dev/null || PROBE_LOG=""
+  PROBE_RAWFILE="$(mktemp /tmp/masscan-probe.XXXXXX 2>/dev/null)" || PROBE_RAWFILE=""
+
   info "备份当前状态…"
   snapshot "before"
 
-  # 调优前基准
-  if [ "$SKIP_BENCH" -eq 0 ]; then
-    [ -z "$BENCH_RATE" ] && BENCH_RATE=$RECOMMEND_RATE
+  # 基准目标：--bench-wan 优先，其次 --bench-target / 默认值，最后才是 veth 隔离
+  if [ -n "$BENCH_WAN" ]; then
+    BENCH_IFACE="$IFACE"
+    BENCH_SRC_IP="$IF_IP"
+    BENCH_SRC_MAC="$IF_MAC"
+    BENCH_ROUTER_MAC="$GW_MAC"
+    BENCH_ISOLATED=0
+    BENCH_TARGET="$BENCH_WAN"
+    BENCH_TARGET_SRC="真实外网目标段(授权)"
+    parse_bench_targets "$BENCH_WAN" || SKIP_BENCH=1
+    [ "$BENCH_SECS" -eq 3 ] && BENCH_SECS=5
+  elif [ "$SKIP_BENCH" -eq 0 ]; then
+    probe_bench_target
+  fi
+
+  # 调优前基准（--bench-wan 走独立标定，不参与前后对比）
+  if [ "$SKIP_BENCH" -eq 0 ] && [ -z "$BENCH_WAN" ]; then
     bench_run before
   fi
 
@@ -1282,16 +1753,37 @@ BANNER
   snapshot "after"
 
   # 调优后基准
-  if [ "$SKIP_BENCH" -eq 0 ]; then
+  if [ "$SKIP_BENCH" -eq 0 ] && [ -z "$BENCH_WAN" ]; then
     hr
     info "复测以验证效果…"
     bench_run after
   fi
 
-  hr
+  # 实测校准：用真实吞吐反推推荐 rate
+  if [ "$CALIBRATE" -eq 1 ]; then
+    if [ -n "$BENCH_WAN" ]; then
+      calibrate_wan "$BENCH_WAN"
+    elif [ "$SKIP_BENCH" -eq 0 ]; then
+      calibrate_rate
+    fi
+  fi
+
+  # 拆掉隔离测试网络
+  if [ "$BENCH_ISOLATED" -eq 1 ]; then
+    teardown_bench_isolation
+    info "隔离测试网络已拆除"
+  fi
+
+  sync_scan_script
+
   report
 
-  printf '\n%s完成。日志: %s%s\n' "$C_G" "${LOG_FILE:-控制台}" "$C_0"
+  hr
+  printf '  %-14s %s%s%s pps\n' "推荐 rate" "$C_D" "$RECOMMEND_RATE" "$C_0"
+  printf '  %-14s %s pps\n' "实测峰值" "${RATE_MEASURED:-0}"
+  [ -n "$REPORT_MD" ] && printf '  %-14s %s\n' "报告文件" "$REPORT_MD"
+  hr
+  printf '\n%s完成。%s\n' "$C_G" "$C_0"
 }
 
 main "$@"
