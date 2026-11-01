@@ -7,12 +7,72 @@ function pause(){
 }
 
 # 系统命令菜单：包含系统更新、组件安装、安装Masscan、安装Node、修改名称、修改密码、重启系统
+# 架设 FTP：一键部署 vsftpd，目录 /root/Data，账号 adm1n / 密码 adm1n
+function install_ftp() {
+  local FTP_USER="adm1n" FTP_PASS="adm1n" FTP_DIR="/root/Data"
+  local PASV_MIN=40000 PASV_MAX=40100
+
+  [ "$(id -u)" -eq 0 ] || { echo "请用 root 运行"; return 1; }
+
+  echo "正在安装 vsftpd..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y || { echo "apt update 失败"; return 1; }
+  apt-get install -y vsftpd || { echo "vsftpd 安装失败"; return 1; }
+
+  mkdir -p "$FTP_DIR"
+  if id "$FTP_USER" >/dev/null 2>&1; then
+    usermod -d "$FTP_DIR" -s /usr/sbin/nologin "$FTP_USER"
+  else
+    useradd -d "$FTP_DIR" -s /usr/sbin/nologin "$FTP_USER"
+  fi
+  echo "$FTP_USER:$FTP_PASS" | chpasswd
+  grep -qxF /usr/sbin/nologin /etc/shells || echo /usr/sbin/nologin >> /etc/shells
+
+  chown -R "$FTP_USER:$FTP_USER" "$FTP_DIR"
+  chmod 755 /root "$FTP_DIR"
+
+  [ -f /etc/vsftpd.conf.orig ] || cp /etc/vsftpd.conf /etc/vsftpd.conf.orig 2>/dev/null || true
+
+  cat > /etc/vsftpd.conf <<EOF
+listen=YES
+listen_ipv6=NO
+anonymous_enable=NO
+local_enable=YES
+write_enable=YES
+local_umask=022
+dirmessage_enable=YES
+use_localtime=YES
+xferlog_enable=YES
+connect_from_port_20=YES
+chroot_local_user=YES
+allow_writeable_chroot=YES
+local_root=${FTP_DIR}
+pasv_enable=YES
+pasv_min_port=${PASV_MIN}
+pasv_max_port=${PASV_MAX}
+pam_service_name=vsftpd
+secure_chroot_dir=/var/run/vsftpd/empty
+utf8_filesystem=YES
+EOF
+
+  systemctl enable vsftpd >/dev/null 2>&1 || true
+  systemctl restart vsftpd || { echo "vsftpd 启动失败"; return 1; }
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow 20,21/tcp >/dev/null
+    ufw allow "${PASV_MIN}:${PASV_MAX}/tcp" >/dev/null
+  fi
+
+  echo "FTP 已就绪：${FTP_USER} / ${FTP_PASS} -> ${FTP_DIR}"
+  systemctl is-active vsftpd >/dev/null 2>&1 && echo "服务状态：运行中"
+}
+
 function system_commands_menu() {
   clear
     printf "+------------------------------------------------------+\n"
     printf "|         1. 系统更新        |        2. 组件安装      |\n"
     printf "+------------------------------------------------------+\n"
-    printf "|         3. 安装 Massca     |        4. 安装 Node     |\n"
+    printf "|         3. 安装 Massca     |        4. 架设 FTP      |\n"
     printf "+------------------------------------------------------+\n"
     printf "|         5. 安装3X-UI       |        6. 安装BBR       |\n"
     printf "+------------------------------------------------------+\n"
@@ -43,8 +103,7 @@ function system_commands_menu() {
       rm -rf /root/masscan
       ;;
     4)
-      echo "正在安装 Node.js 及 npm..."
-      wget https://nodejs.org/dist/v22.3.0/node-v22.3.0-linux-x64.tar.xz && tar -xvf node-v22.3.0-linux-x64.tar.xz && ln -s /root/node-v22.3.0-linux-x64/bin/node /usr/local/bin/node && ln -s /root/node-v22.3.0-linux-x64/bin/npm /usr/local/bin/npm && npm install axios && npm install express && npm install cheerio
+      install_ftp
       ;;
     5)
       echo "正在安装3X-UI..."
