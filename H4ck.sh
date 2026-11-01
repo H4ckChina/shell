@@ -94,8 +94,9 @@ function system_commands_menu() {
     3)
       echo "正在安装 Masscan..."
       sudo apt install -y git make gcc clang libpcap-dev
-      git clone https://github.com/robertdavidgraham/masscan
-      cd masscan
+      rm -rf /root/masscan
+      git clone https://github.com/robertdavidgraham/masscan /root/masscan
+      cd /root/masscan
       make -j$(nproc)  # 多线程编译加速
       sudo make install
       masscan --version
@@ -107,7 +108,7 @@ function system_commands_menu() {
       ;;
     5)
       echo "正在安装3X-UI..."
-      bash <(curl -Ls https://raw.githubusercontent.com/xeefei/3x-ui/master/install.sh)
+      cd /root && bash <(curl -Ls https://raw.githubusercontent.com/xeefei/3x-ui/master/install.sh)
       ;;
     6)
       echo "正在安装BBR..."
@@ -137,6 +138,7 @@ function system_commands_menu() {
       echo "无效选项，请重新输入"
       ;;
   esac
+  cd /root 2>/dev/null || true
   pause
   system_commands_menu
 }
@@ -168,7 +170,8 @@ function proxy_menu() {
       ;;
     4)
       echo "正在克隆 Proxy 文件..."
-      git clone https://github.com/H4ckChina/Proxy.git && rm -rf /root/Proxy/.git && chmod +wx /root/Proxy/xmrig-proxy
+      if [ -d /root/Proxy ]; then mv /root/Proxy "/root/Proxy.bak.$(date +%Y%m%d-%H%M%S)" && echo "旧目录已备份为 /root/Proxy.bak.*"; fi
+      git clone https://github.com/H4ckChina/Proxy.git /root/Proxy && rm -rf /root/Proxy/.git && chmod +wx /root/Proxy/xmrig-proxy
       ;;
     0)
       return 0
@@ -177,6 +180,7 @@ function proxy_menu() {
       echo "无效选项，请重新输入"
       ;;
   esac
+  cd /root 2>/dev/null || true
   pause
   proxy_menu
 }
@@ -208,7 +212,8 @@ function scan_menu() {
       ;;
     4)
       echo "正在克隆 Scan 文件..."
-      cd /root && git clone https://github.com/H4ckChina/Scan.git && rm -rf /root/Scan/.git && chmod +wx /root/Scan/Scan.sh
+      if [ -d /root/Scan ]; then mv /root/Scan "/root/Scan.bak.$(date +%Y%m%d-%H%M%S)" && echo "旧目录已备份为 /root/Scan.bak.*"; fi
+      git clone https://github.com/H4ckChina/Scan.git /root/Scan && rm -rf /root/Scan/.git && chmod +wx /root/Scan/Scan.sh
       ;;
     5)
       echo "正在优化系统..."
@@ -1820,6 +1825,7 @@ BANNER
       echo "无效选项，请重新输入"
       ;;
   esac
+  cd /root 2>/dev/null || true
   pause
   scan_menu
 }
